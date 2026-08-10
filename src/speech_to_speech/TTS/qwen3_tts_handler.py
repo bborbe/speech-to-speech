@@ -675,6 +675,35 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         sr = getattr(item, "sample_rate", None) or PIPELINE_SR
         return audio_chunk, sr
 
+    def _release_mlx_cache(self) -> None:
+        """Return MLX's buffer cache to the OS after a synthesis.
+
+        `cleanup()` already calls `mx.clear_cache()`, but only at shutdown —
+        the moment the memory stops mattering. Between then and startup the pool
+        is reclaimed only when the process goes idle, which is fine at
+        conversational pace and unbounded when it is not: with several speakers
+        in one channel the pipeline never idles, and per-turn transient
+        allocation stacks instead of being reclaimed. Observed 2026-08-10 on an
+        M-series laptop — ~50 GB after two and a half hours of continuous
+        multi-speaker traffic, driving the machine to 65.8 GB of swap.
+
+        `LLM/language_model.py` already clears after every local generation.
+        This mirrors it for synthesis, so the peak scales with one utterance
+        rather than with how long traffic has been continuous.
+        """
+        if self.backend != "mlx":
+            return
+        try:
+            import mlx.core as mx
+
+            clear = getattr(mx, "clear_cache", None) or getattr(
+                getattr(mx, "metal", None), "clear_cache", None
+            )
+            if clear:
+                clear()
+        except Exception:  # never let bookkeeping break a turn
+            pass
+
     def _stream(self, gen: Any, label: str) -> Iterator[bytes | np.ndarray]:
         """Common streaming loop: log TTFA and RTF, yield int16 chunks."""
         cancel_gen = self.cancel_scope.generation if self.cancel_scope else None
@@ -687,6 +716,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         for item in gen:
             if cancel_gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(cancel_gen):
                 logger.info("TTS generation cancelled (interruption)")
+                # An interrupted synthesis allocated too, and barge-in is common
+                # enough that skipping the release here would leave the busiest
+                # path the only one that never frees.
+                self._release_mlx_cache()
                 return
 
             audio_chunk, sr = self._prepare_audio_chunk(item)
@@ -730,6 +763,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         logger.info(
             f"Qwen3-TTS generated {audio_duration:.2f}s audio in {generation_time:.2f}s (RTF: {rtf:.2f}, {label})"
         )
+        self._release_mlx_cache()
 
     def _coalesce_pending_tts_input(self, current_input: TTSInput) -> tuple[str, Optional[str], bool]:
         """Combine already-queued text chunks before the next TTS synthesis call."""

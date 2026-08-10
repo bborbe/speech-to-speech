@@ -233,6 +233,37 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
         except Exception as e:
             logger.warning(f"Warmup failed: {e}")
 
+    def _release_mlx_cache(self) -> None:
+        """Return MLX's buffer cache to the OS after an utterance.
+
+        MLX keeps freed Metal buffers in a reusable pool instead of releasing
+        them, so the pool is only reclaimed when the process goes idle. That is
+        harmless at conversational pace and unbounded under sustained load: with
+        several speakers in one channel the pipeline never goes idle, and the
+        per-turn transient allocation stacks instead of being reclaimed. Observed
+        2026-08-10 on an M-series laptop — the pipeline reached ~50 GB over two
+        and a half hours of continuous multi-speaker traffic and drove the machine
+        to 65.8 GB of swap.
+
+        `LLM/language_model.py` already does this after every local generation;
+        this mirrors it for the STT path so the peak scales with a single
+        utterance rather than with how long traffic has been continuous.
+
+        Cheap: the next inference re-warms the pool from the same allocator.
+        """
+        if self.backend != "mlx":
+            return
+        try:
+            import mlx.core as mx
+
+            clear = getattr(mx, "clear_cache", None) or getattr(
+                getattr(mx, "metal", None), "clear_cache", None
+            )
+            if clear:
+                clear()
+        except Exception:  # never let bookkeeping break a turn
+            pass
+
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
         """
         Process audio and generate transcription.
@@ -360,6 +391,8 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
         if self.enable_live_transcription:
             self.processing_final = False
             self._reset_live_transcription_state(clear_turn=True)
+
+        self._release_mlx_cache()
 
         yield Transcription(
             text=pred_text,
