@@ -196,6 +196,10 @@ def test_build_extra_body_variants():
     assert f("http://x/v1", True, "") == {"chat_template_kwargs": {"enable_thinking": False}}  # empty effort ignored
     assert f("http://x/v1", False, None) is None
     assert f(None, True, None) is None
+    # MiniMax ignores both other flags and needs its own key; it wins over an explicit effort
+    assert f("https://api.minimax.io/v1", True, "none") == {"thinking": {"type": "disabled"}}
+    assert f("https://api.minimaxi.com/v1", True, None) == {"thinking": {"type": "disabled"}}
+    assert f("https://api.minimax.io/v1", False, None) is None  # nothing to disable
 
 
 def test_chat_messages_encodes_tool_arguments_as_string():
