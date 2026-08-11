@@ -1514,13 +1514,21 @@ class TestDispatchPipelineEvent:
         # Slot released so the next response is not locked out.
         assert service._state(conn_id).in_response is False
 
-    def test_response_failed_without_active_response_is_noop(self, service, conn_id):
-        # No active response (e.g. already closed): nothing to fail, emit nothing.
+    def test_response_failed_without_active_response_still_reports_the_error(self, service, conn_id):
+        # No active response — the case a mic turn hits when the LLM raises before
+        # any assistant text reaches _ensure_response. The reason must still reach
+        # the client: silence here is indistinguishable from an unaddressed
+        # utterance, and the client has no other channel that carries the message.
         events = service.dispatch_pipeline_event(
             conn_id,
             ResponseFailedEvent(message="too late"),
         )
-        assert events == []
+        err = events[0]
+        assert isinstance(err, RealtimeErrorEvent)
+        assert err.error.message == "too late"
+        assert err.error.type == "response_failed"
+        # ...but no slot was open, so nothing is closed.
+        assert not [e for e in events if isinstance(e, ResponseDoneEvent)]
 
     # -- unknown --
 

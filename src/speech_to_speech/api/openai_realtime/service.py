@@ -482,15 +482,23 @@ class RealtimeService:
         the human-readable reason — ``response.done.status_details.error`` only
         has code/type, no message — then ``finish_response`` closes the slot.
 
-        Idempotent: gated on an active response, and ``finish_response`` is itself
-        a no-op once the slot is closed, so a later EndOfResponse-driven close does
-        nothing.
+        The error is emitted unconditionally; only the close is gated. A mic turn
+        never sets ``in_response`` until the first assistant text reaches
+        ``_ensure_response``, so a failure *before* any text — the LLM raising on
+        its first call — left the guard swallowing the only message that says why
+        the turn produced nothing. The client then cannot distinguish a failed
+        answer from an unaddressed utterance. (Real case: a missing NLTK
+        ``punkt_tab`` made ``sent_tokenize`` raise on every spoken turn for 30
+        hours while every health signal stayed green.)
+
+        Idempotent: ``finish_response`` is a no-op once the slot is closed, so a
+        later EndOfResponse-driven close does nothing. Closing a slot that was
+        never open is what the remaining gate prevents.
         """
         logger.info("Response failed: %s", event.message)
-        if not self._state(conn_id).in_response:
-            return []
         events: list[ServerEvent] = [self.make_error(event.message, "response_failed")]
-        events.extend(self.response.finish_response(conn_id, status="failed"))
+        if self._state(conn_id).in_response:
+            events.extend(self.response.finish_response(conn_id, status="failed"))
         return events
 
     def get_usage(self) -> dict[str, Any]:
