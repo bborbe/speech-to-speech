@@ -783,6 +783,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         return combined_text, language_code, saw_end_of_response
 
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
+        # Dequeue timestamp: the moment this handler picked the input up.
+        # Combined with tts_input.text_ready_at_s (set on enqueue by the LM
+        # output processor) this splits the text-ready -> audio-out window
+        # into queue wait and synthesis time.
+        dequeued_at_s = perf_counter()
         speculative_turns = getattr(self, "speculative_turns", None)
         if isinstance(tts_input, EndOfResponse):
             if speculative_turns and not speculative_turns.is_latest_after_reopen_grace(
@@ -790,6 +795,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 tts_input.turn_revision,
             ):
                 return
+            self._emit_turn_summary(tts_input)
             yield AUDIO_RESPONSE_DONE
             return
 
@@ -830,6 +836,8 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             for audio_chunk in audio_iter:
                 if first_audio:
                     self._log_first_audio_latency(tts_input)
+                    self._log_text_ready_latency(tts_input, dequeued_at_s)
+                    self._record_turn_latency(tts_input, dequeued_at_s)
                     first_audio = False
                 yield audio_chunk
         except Exception as e:
@@ -847,6 +855,98 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             tts_input.turn_id,
             tts_input.turn_revision,
         )
+
+    def _log_text_ready_latency(self, tts_input: TTSInput, dequeued_at_s: float) -> None:
+        """Log the text-ready -> audio-out window and its queue-wait/synthesis split.
+
+        ``text_ready_at_s`` is captured by the LM output processor when the text
+        is forwarded to TTS (enqueue); ``dequeued_at_s`` is when this handler
+        picked the input up. The split makes the cold-start gap attributable:
+        queue wait (TTS still busy on a prior sentence, MLX lock blocked)
+        versus synthesis time (model load/generate).
+        """
+        if tts_input.text_ready_at_s is None:
+            return
+        first_audio_at_s = perf_counter()
+        total_s = first_audio_at_s - tts_input.text_ready_at_s
+        if total_s < 0:
+            return
+        queue_wait_s = dequeued_at_s - tts_input.text_ready_at_s
+        synthesis_s = first_audio_at_s - dequeued_at_s
+        logger.info(
+            "Qwen3-TTS text-ready to first audio out: %.3fs (queue wait %.3fs, synthesis %.3fs) (turn=%s rev=%s)",
+            total_s,
+            queue_wait_s,
+            synthesis_s,
+            tts_input.turn_id,
+            tts_input.turn_revision,
+        )
+
+    def _record_turn_latency(self, tts_input: TTSInput, dequeued_at_s: float) -> None:
+        """Remember the first sentence's timings so the turn summary can emit them.
+
+        A turn spans several TTSInputs (one per sentence); only the first one
+        that produced audio is recorded, keyed by (turn_id, turn_revision).
+        """
+        if tts_input.text_ready_at_s is None or tts_input.turn_id is None:
+            return
+        turn_state = getattr(self, "_turn_latency", None)
+        if turn_state is None:
+            turn_state = {}
+            self._turn_latency = turn_state
+        key = (tts_input.turn_id, tts_input.turn_revision)
+        if key in turn_state:
+            return
+        if len(turn_state) >= 32:
+            turn_state.pop(next(iter(turn_state)))
+        turn_state[key] = {
+            "speech_stopped_at_s": tts_input.speech_stopped_at_s,
+            "text_ready_at_s": tts_input.text_ready_at_s,
+            "dequeued_at_s": dequeued_at_s,
+            "first_audio_at_s": perf_counter(),
+        }
+
+    def _emit_turn_summary(self, tts_input: EndOfResponse) -> None:
+        """Emit one correlated per-turn line aggregating the stage timings.
+
+        This is the SC1 record: last-speech -> first-audio with the
+        text-ready -> dequeue (queue wait) and dequeue -> first-audio
+        (synthesis) split, keyed by turn id so the stages no longer need to
+        be pieced together from per-sentence log lines.
+        """
+        turn_state = getattr(self, "_turn_latency", None)
+        if not turn_state:
+            return
+        state = turn_state.pop((tts_input.turn_id, tts_input.turn_revision), None)
+        if state is None:
+            return
+        total_s = None
+        if state["speech_stopped_at_s"] is not None:
+            total_s = state["first_audio_at_s"] - state["speech_stopped_at_s"]
+            if total_s < 0:
+                return
+        queue_wait_s = state["dequeued_at_s"] - state["text_ready_at_s"]
+        synthesis_s = state["first_audio_at_s"] - state["dequeued_at_s"]
+        if total_s is not None:
+            logger.info(
+                "Qwen3-TTS turn summary (turn=%s rev=%s): last-speech->first-audio %.3fs "
+                "(text-ready->dequeue %.3fs, dequeue->first-audio %.3fs)",
+                tts_input.turn_id,
+                tts_input.turn_revision,
+                total_s,
+                queue_wait_s,
+                synthesis_s,
+            )
+        else:
+            logger.info(
+                "Qwen3-TTS turn summary (turn=%s rev=%s): text-ready->first-audio %.3fs "
+                "(text-ready->dequeue %.3fs, dequeue->first-audio %.3fs)",
+                tts_input.turn_id,
+                tts_input.turn_revision,
+                queue_wait_s + synthesis_s,
+                queue_wait_s,
+                synthesis_s,
+            )
 
     def _mlx_streaming_interval(self) -> float:
         return max(1, self.streaming_chunk_size) / MLX_STREAMING_TOKENS_PER_SECOND
@@ -867,9 +967,14 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         max_tokens: int,
         **generation_kwargs: Any,
     ) -> Iterator[bytes | np.ndarray]:
+        lock_wait_start = perf_counter()
         with MLXLockContext(handler_name="Qwen3TTS", timeout=10.0) as acquired:
             if not acquired:
                 raise TimeoutError("Timed out waiting for MLX lock")
+            # STT and TTS share the global MLX lock, so a busy STT or a cold
+            # MLX load can leave TTS waiting here. Log the wait separately from
+            # the hold (generation) time so the cold-start gap is attributable.
+            logger.info("Qwen3-TTS MLX lock wait: %.3fs (%s)", perf_counter() - lock_wait_start, label)
             yield from self._stream(
                 generation_fn(
                     **self._mlx_stream_kwargs(max_tokens=max_tokens),
