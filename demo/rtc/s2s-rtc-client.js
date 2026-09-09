@@ -132,10 +132,12 @@ export class S2sRtcRealtimeClient extends EventTarget {
      * (drop it). Attribution is by "RMS opened while this response was
      * active" — sound can't be tied to a response id without audio events. */
     this._audibleResponses = new Set();
-    /** @type {Map<string, string>} CURRENT assistant transcript segment per
-     * response, accumulated from streamed deltas (reset on segment done). */
+    /** @type {Map<string, string>} In-progress assistant transcript per
+     * response, accumulated from streamed deltas until the terminal done. */
     this._asstTranscriptByResp = new Map();
-    /** @type {Map<string, string>} Completed segments per response, joined. */
+    /** @type {Map<string, string>} Terminal assistant transcript per response.
+     * Realtime emits one `*.transcript.done`; appending remains for compatibility
+     * with legacy endpoints that emitted a done event for every text segment. */
     this._asstFullByResp = new Map();
     this._muted = false;
     // ── Response lock ────────────────────────────────────────────────────
@@ -164,8 +166,9 @@ export class S2sRtcRealtimeClient extends EventTarget {
     this.dispatchEvent(new CustomEvent("status", { detail: { status } }));
   }
 
-  /** Full assistant transcript so far for a response: completed segments plus
-   *  the in-progress one. @param {string} rid @returns {string} */
+  /** Full assistant transcript so far for a response: a terminal transcript,
+   *  when present, plus any in-progress deltas from a legacy segmented stream.
+   *  @param {string} rid @returns {string} */
   _asstDisplay(rid) {
     const full = this._asstFullByResp.get(rid) || "";
     const seg = this._asstTranscriptByResp.get(rid) || "";
@@ -575,6 +578,10 @@ export class S2sRtcRealtimeClient extends EventTarget {
               },
             }),
           );
+        } else if (this._status === "processing" && !this._responsePending()) {
+          // Empty STT results intentionally do not create a response, so there
+          // will be no response.done event to return the UI to listening.
+          this._setStatus("connected");
         }
         break;
       }
@@ -598,8 +605,9 @@ export class S2sRtcRealtimeClient extends EventTarget {
       case "response.audio_transcript.done":
       case "response.output_audio_transcript.done": {
         const rid = typeof event.response_id === "string" ? event.response_id : "";
-        // ONE completed segment; a response can emit several — concatenate
-        // until response.done clears the accumulator.
+        // This terminalizes the assistant transcript for the response. Realtime
+        // emits it once after all deltas; retain space-joining only for legacy
+        // endpoints that emitted a done event for every text segment.
         const segment =
           (typeof event.transcript === "string" && event.transcript) ||
           this._asstTranscriptByResp.get(rid) ||
@@ -772,6 +780,11 @@ export class S2sRtcRealtimeClient extends EventTarget {
 
   _responseActive() {
     return this._openResponses > 0 || this._createInFlight;
+  }
+
+  /** True while a response is active, awaiting confirmation, or queued. */
+  _responsePending() {
+    return this._responseActive() || this._createQueue.length > 0;
   }
 
   /** @param {{ image?: string }} [opts] */

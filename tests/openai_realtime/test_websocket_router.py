@@ -12,6 +12,7 @@ import time
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
 
+import numpy as np
 import pytest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketState
@@ -23,7 +24,12 @@ from speech_to_speech.api.openai_realtime.transports import WebSocketTransport
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
-from speech_to_speech.pipeline.events import AssistantTextEvent, SpeechStartedEvent, TokenUsageEvent
+from speech_to_speech.pipeline.events import (
+    AssistantTextEvent,
+    AudioInputCompletedEvent,
+    SpeechStartedEvent,
+    TokenUsageEvent,
+)
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END, AudioOutput
 
 # ---------------------------------------------------------------------------
@@ -196,6 +202,29 @@ class TestClientEventDispatch:
                 time.sleep(0.1)
                 cid = service.connection_ids[0]
                 assert service._state(cid).runtime_config.session.audio.output.voice == "coral"
+
+    def test_session_update_receives_session_updated_confirmation(self, setup):
+        """The OpenAI Realtime protocol requires a session.updated reply to
+        every successful session.update, unless there is an error:
+        https://platform.openai.com/docs/api-reference/realtime-server-events/session/updated
+        """
+        app, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "audio": {"output": {"voice": "coral"}},
+                        },
+                    }
+                )
+                msg = ws.receive_json()
+                assert msg["type"] == "session.updated"
+                assert msg["event_id"].startswith("event_")
+                assert msg["session"]["audio"]["output"]["voice"] == "coral"
 
     def test_conversation_item_create_returns_events(self, setup):
         app, *_ = setup
@@ -534,9 +563,7 @@ class TestSendLoop:
                 output_queue.put(AUDIO_RESPONSE_DONE)
 
                 assert ws.receive_json()["type"] == "response.function_call_arguments.done"
-                msg1 = ws.receive_json()
-                msg2 = ws.receive_json()
-                assert {msg1["type"], msg2["type"]} == {"response.output_audio.done", "response.done"}
+                assert ws.receive_json()["type"] == "response.done"
 
                 assert service.total_usage.input_tokens == 10
                 assert service.total_usage.output_tokens == 5
@@ -581,11 +608,11 @@ class TestSendLoop:
         done_events = service.finish_response(conn_id)
 
         assert [payload["type"] for payload in ws.sent] == ["response.function_call_arguments.done"]
-        assert [event.type for event in done_events] == ["response.output_audio.done", "response.done"]
+        assert [event.type for event in done_events] == ["response.done"]
         assert ws.sent[0]["response_id"] == response_id
-        assert done_events[1].response.id == response_id
-        assert done_events[1].response.usage.input_tokens == 10
-        assert done_events[1].response.usage.output_tokens == 5
+        assert done_events[0].response.id == response_id
+        assert done_events[0].response.usage.input_tokens == 10
+        assert done_events[0].response.usage.output_tokens == 5
         assert text_output_queue.empty()
 
     def test_response_completion_drain_preserves_usage_across_non_response_boundary(self, setup):
@@ -622,8 +649,8 @@ class TestSendLoop:
 
         assert [payload["type"] for payload in ws.sent] == ["response.function_call_arguments.done"]
         assert ws.sent[0]["response_id"] == response_id
-        assert done_events[1].response.usage.input_tokens == 10
-        assert done_events[1].response.usage.output_tokens == 5
+        assert done_events[0].response.usage.input_tokens == 10
+        assert done_events[0].response.usage.output_tokens == 5
 
         boundary = text_output_queue.get_nowait()
         queued_assistant = text_output_queue.get_nowait()
@@ -724,6 +751,17 @@ class TestCleanup:
 
 
 class TestDrainRelease:
+    def test_barge_in_flush_preserves_completed_audio_input(self):
+        q: Queue = Queue()
+        audio_event = AudioInputCompletedEvent(audio=np.zeros(1600, dtype=np.float32), audio_duration_s=0.1)
+        q.put(AssistantTextEvent(text="stale"))
+        q.put(audio_event)
+
+        router_module._flush_queue(q, preserve=router_module._keep_user_text_event)
+
+        assert q.get_nowait() is audio_event
+        assert q.empty()
+
     def test_barge_in_flush_preserves_session_end(self):
         """The output_queue flush on barge-in must not swallow an in-flight
         SESSION_END — losing it would leave the release task waiting forever."""

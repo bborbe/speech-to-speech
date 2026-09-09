@@ -30,12 +30,14 @@ from openai.types.realtime.realtime_conversation_item_user_message import (
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 
 from speech_to_speech.LLM.chat import (
+    AUDIO_INPUT_HISTORY_PLACEHOLDER,
     Chat,
     ChatItemError,
     CompactionResult,
     build_active_chat,
     make_assistant_message,
     make_system_message,
+    make_user_audio_message,
     make_user_message,
 )
 
@@ -140,6 +142,15 @@ class TestFactoryHelpers:
         assert len(msg.content) == 1
         assert msg.content[0].type == "input_text"
         assert msg.content[0].text == "hello"
+
+    def test_make_user_audio_message(self):
+        msg = make_user_audio_message("abc123")
+        assert isinstance(msg, RealtimeConversationItemUserMessage)
+        assert msg.role == "user"
+        assert msg.type == "message"
+        assert len(msg.content) == 1
+        assert msg.content[0].type == "input_audio"
+        assert msg.content[0].audio == "abc123"
 
     def test_make_assistant_message(self):
         msg = make_assistant_message("world")
@@ -369,6 +380,14 @@ class TestAddItem:
         assert len(chat.buffer[0].content) == 1
         assert chat.buffer[0].content[0].type == "input_text"
 
+    def test_user_message_keeps_audio_content_with_base64_audio(self):
+        chat = Chat(size=5)
+        msg = make_user_audio_message("abc123")
+        chat.add_item(msg)
+        assert len(chat.buffer[0].content) == 1
+        assert chat.buffer[0].content[0].type == "input_audio"
+        assert chat.buffer[0].content[0].audio == "abc123"
+
     def test_user_message_keeps_image_content(self):
         chat = Chat(size=5)
         msg = _user_msg_with_parts(("text", "look"), ("image", "http://img.png"))
@@ -532,6 +551,25 @@ class TestToResponseApiChat:
         assert content[0]["type"] == "input_text"
         assert content[1]["type"] == "input_image"
         assert content[1]["image_url"] == "http://img.png"
+
+    def test_user_audio_message_becomes_role_preserving_placeholder(self):
+        chat = Chat(size=5)
+        chat.add_item(make_user_audio_message("abc123"))
+
+        result = chat.to_responses_api_chat()
+
+        assert result == [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": AUDIO_INPUT_HISTORY_PLACEHOLDER,
+                    }
+                ],
+            }
+        ]
 
     def test_assistant_message(self):
         chat = Chat(size=5)
@@ -740,6 +778,43 @@ class TestToTransformersChat:
         assert result[3]["role"] == "tool"
         assert result[3]["name"] == "action"
         assert result[4] == {"role": "assistant", "content": "All set."}
+
+    def test_function_call_carries_empty_content(self):
+        chat = Chat(size=5)
+        chat.add_item(_fc("c1", "search", '{"query": "test"}'))
+        chat.add_item(_fco("c1", "ok"))
+        entry = chat.to_transformers_chat()[0]
+        assert entry["content"] == ""
+
+    def test_every_assistant_entry_exposes_content(self):
+        chat = Chat(size=10)
+        chat.add_item(_user("Do it"))
+        chat.add_item(_fc("c1", "action", '{"a": 1}'))
+        chat.add_item(_fco("c1", "done"))
+        chat.add_item(_assistant("All set."))
+
+        assistant_entries = [m for m in chat.to_transformers_chat() if m["role"] == "assistant"]
+        assert len(assistant_entries) == 2
+        assert all("content" in m for m in assistant_entries)
+
+    def test_function_call_renders_in_template_reading_content(self):
+        """Chat templates read ``content`` on every assistant message, tool calls included.
+
+        Concatenation mirrors what the Qwen3 template does; a missing key would
+        leave an undefined value here and raise rather than render empty.
+        """
+        sandbox = pytest.importorskip("jinja2.sandbox")
+
+        chat = Chat(size=5)
+        chat.add_item(_user("What's the weather?"))
+        chat.add_item(_fc("c1", "get_weather", '{"city": "Paris"}'))
+        chat.add_item(_fco("c1", "18C, clear"))
+
+        template = sandbox.ImmutableSandboxedEnvironment().from_string(
+            "{% for m in messages %}{{ m.role + ':' + m.content + '\\n' }}{% endfor %}"
+        )
+        rendered = template.render(messages=chat.to_transformers_chat())
+        assert "assistant:\n" in rendered
 
 
 # ===================================================================

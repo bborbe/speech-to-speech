@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 from openai.types.realtime import (
+    ConversationItem,
+    RealtimeConversationItemFunctionCall,
     RealtimeResponse,
     ResponseAudioDoneEvent,
+    ResponseAudioTranscriptDeltaEvent,
     ResponseAudioTranscriptDoneEvent,
     ResponseCreatedEvent,
     ResponseCreateEvent,
@@ -14,6 +17,8 @@ from openai.types.realtime import (
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
 )
+from openai.types.realtime.conversation_item import RealtimeConversationItemAssistantMessage
+from openai.types.realtime.realtime_conversation_item_assistant_message import Content
 from openai.types.realtime.realtime_response import Audio, AudioOutput
 from openai.types.realtime.realtime_response_status import RealtimeResponseStatus
 from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
@@ -71,6 +76,9 @@ class ResponseHandler(RealtimeBaseHandler):
         st.response_pending = False
         st.current_response_params = None
         st.pending_output_text_parts = []
+        st.pending_assistant_item_id = None
+        st.pending_assistant_output_index = None
+        st.pending_function_calls = []
 
     def _start_item(self, conn_id: str) -> str:
         """Generate a new item ID, reset content index, and store it."""
@@ -83,6 +91,16 @@ class ResponseHandler(RealtimeBaseHandler):
 
     def _current_item_id(self, conn_id: str) -> str:
         return self._state(conn_id).current_item_id or self._start_item(conn_id)
+
+    def _ensure_assistant_output_item(self, conn_id: str, item_id: str) -> tuple[str, int]:
+        """Reserve the assistant's stable response-wide item ID and index."""
+        st = self._state(conn_id)
+        if st.pending_assistant_item_id is None:
+            st.pending_assistant_item_id = item_id
+            st.pending_assistant_output_index = len(st.pending_function_calls)
+            st.last_item_id = item_id
+        assert st.pending_assistant_output_index is not None
+        return st.pending_assistant_item_id, st.pending_assistant_output_index
 
     def _next_content_index(self, conn_id: str) -> int:
         """Return the current content index and advance it."""
@@ -125,12 +143,61 @@ class ResponseHandler(RealtimeBaseHandler):
             audio=Audio(output=AudioOutput(voice=str(voice) if voice else None)),  # type: ignore[arg-type]
             conversation_id=conversation_id,
             metadata=metadata,
+            output=self._build_output_items(conn_id, status),
             usage=RealtimeResponseUsage(
                 input_tokens=st.response_usage.input_tokens,
                 output_tokens=st.response_usage.output_tokens,
                 total_tokens=st.response_usage.input_tokens + st.response_usage.output_tokens,
             ),
         )
+
+    # Annotated with ConversationItem (the SDK's own 9-type item union) rather
+    # than the two types actually produced: list is invariant, so a narrower
+    # element type is rejected where RealtimeResponse.output is assigned.
+    def _build_output_items(self, conn_id: str, status: _ResponseStatus) -> list[ConversationItem]:
+        """Build response.output in the same item order used by streaming events,
+        per the OpenAI Realtime protocol - see
+        https://platform.openai.com/docs/api-reference/realtime-server-events/session/updated
+        ("response.done will also have the complete data we need to call our function").
+        """
+        st = self._state(conn_id)
+        assistant_status: Literal["completed", "incomplete"] = "completed" if status == "completed" else "incomplete"
+        output: list[ConversationItem] = []
+        for call in st.pending_function_calls:
+            if call.status in ("completed", "incomplete"):
+                call_status = call.status
+            elif status == "completed":
+                call_status = "completed"
+            else:
+                call_status = "incomplete"
+            output.append(call.model_copy(update={"object": "realtime.item", "status": call_status}))
+
+        text = self._assistant_text(conn_id)
+        if st.pending_assistant_item_id is not None:
+            if response_wants_audio(st.current_response_params):
+                content = Content(type="output_audio", transcript=text)
+            else:
+                content = Content(type="output_text", text=text)
+            message = RealtimeConversationItemAssistantMessage(
+                type="message",
+                role="assistant",
+                id=st.pending_assistant_item_id,
+                object="realtime.item",
+                status=assistant_status,
+                content=[content],
+            )
+            output.insert(
+                st.pending_assistant_output_index if st.pending_assistant_output_index is not None else 0,
+                message,
+            )
+        return output
+
+    def _assistant_text(self, conn_id: str) -> str:
+        """Assemble transcript parts using the active output modality's semantics."""
+        st = self._state(conn_id)
+        if response_wants_audio(st.current_response_params):
+            return " ".join(part.strip() for part in st.pending_output_text_parts if part.strip())
+        return "".join(st.pending_output_text_parts)
 
     # ── Public handlers ───────────────────────────
 
@@ -211,35 +278,53 @@ class ResponseHandler(RealtimeBaseHandler):
     ) -> list[ServerEvent]:
         """Close the current response (audio/text done + response done).
 
-        Audio responses emit ``response.output_audio.done`` for any terminal
-        status. Text-only responses emit a single ``response.output_text.done``
-        carrying the full streamed text, but only on ``status="completed"`` —
-        a cancelled or failed text response sends no audio, so it just closes
-        with ``response.done``.
+        Audio responses emit ``response.output_audio.done`` unless their only
+        output is a function call, followed by one terminal transcript event
+        when text was produced. Text-only responses emit a single
+        ``response.output_text.done`` carrying the full streamed text, but only
+        on ``status="completed"`` — a cancelled or failed text response sends no
+        audio, so it just closes with ``response.done``.
         """
         st = self._state(conn_id)
         events: list[ServerEvent] = []
         if st.in_response:
             resp_id, item_id = self._ensure_response(conn_id)
-            if response_wants_audio(st.current_response_params):
+            assistant_item_id = st.pending_assistant_item_id or item_id
+            assistant_output_index = (
+                st.pending_assistant_output_index if st.pending_assistant_output_index is not None else 0
+            )
+            function_call_only = bool(st.pending_function_calls) and st.pending_assistant_item_id is None
+            if response_wants_audio(st.current_response_params) and not function_call_only:
                 events.append(
                     ResponseAudioDoneEvent(
                         type="response.output_audio.done",
                         event_id=self._next_event_id(),
                         content_index=0,
-                        item_id=item_id,
-                        output_index=0,
+                        item_id=assistant_item_id,
+                        output_index=assistant_output_index,
                         response_id=resp_id,
                     )
                 )
+                if st.pending_output_text_parts:
+                    events.append(
+                        ResponseAudioTranscriptDoneEvent(
+                            type="response.output_audio_transcript.done",
+                            event_id=self._next_event_id(),
+                            content_index=0,
+                            item_id=assistant_item_id,
+                            output_index=assistant_output_index,
+                            response_id=resp_id,
+                            transcript=self._assistant_text(conn_id),
+                        )
+                    )
             elif status == "completed" and st.pending_output_text_parts:
                 events.append(
                     ResponseTextDoneEvent(
                         type="response.output_text.done",
                         event_id=self._next_event_id(),
                         content_index=0,
-                        item_id=item_id,
-                        output_index=0,
+                        item_id=assistant_item_id,
+                        output_index=assistant_output_index,
                         response_id=resp_id,
                         text="".join(st.pending_output_text_parts),
                     )
@@ -288,19 +373,24 @@ class ResponseHandler(RealtimeBaseHandler):
         st = self._state(conn_id)
         events: list[ServerEvent] = []
         resp_id, item_id = self._ensure_response(conn_id)
-        st.last_item_id = item_id
-        output_idx = 0
-        if event.text:
-            if response_wants_audio(st.current_response_params):
+        wants_audio = response_wants_audio(st.current_response_params)
+        if event.text and (not wants_audio or event.text.strip()):
+            assistant_item_id, assistant_output_index = self._ensure_assistant_output_item(conn_id, item_id)
+            if wants_audio:
+                # Accumulated (not just streamed) so response.done's output can
+                # carry the full transcript as an assistant message item.
+                text_part = event.text.strip()
+                delta = (" " if st.pending_output_text_parts else "") + text_part
+                st.pending_output_text_parts.append(text_part)
                 events.append(
-                    ResponseAudioTranscriptDoneEvent(
-                        type="response.output_audio_transcript.done",
+                    ResponseAudioTranscriptDeltaEvent(
+                        type="response.output_audio_transcript.delta",
                         event_id=self._next_event_id(),
                         content_index=0,
-                        item_id=item_id,
-                        output_index=output_idx,
+                        delta=delta,
+                        item_id=assistant_item_id,
+                        output_index=assistant_output_index,
                         response_id=resp_id,
-                        transcript=event.text,
                     )
                 )
             else:
@@ -313,16 +403,17 @@ class ResponseHandler(RealtimeBaseHandler):
                         type="response.output_text.delta",
                         event_id=self._next_event_id(),
                         content_index=0,
-                        item_id=item_id,
-                        output_index=output_idx,
+                        item_id=assistant_item_id,
+                        output_index=assistant_output_index,
                         response_id=resp_id,
                         delta=event.text,
                     )
                 )
-            output_idx += 1
         if event.tools:
             st.response_usage.tool_calls += len(event.tools)
             for tool in event.tools:
+                function_item_id = tool.id or _generate_id("item")
+                output_idx = len(st.pending_function_calls) + int(st.pending_assistant_item_id is not None)
                 events.append(
                     ResponseFunctionCallArgumentsDoneEvent(
                         type="response.function_call_arguments.done",
@@ -330,10 +421,24 @@ class ResponseHandler(RealtimeBaseHandler):
                         call_id=tool.call_id,
                         name=tool.name,
                         arguments=tool.arguments,
-                        item_id=item_id,
+                        item_id=function_item_id,
                         output_index=output_idx,
                         response_id=resp_id,
                     )
                 )
-                output_idx += 1
+                # Same item_id as the event above, so a client can correlate the
+                # streamed arguments with the item that lands in response.output.
+                # Status is stamped on at close, once the outcome is known.
+                st.pending_function_calls.append(
+                    RealtimeConversationItemFunctionCall(
+                        type="function_call",
+                        object="realtime.item",
+                        id=function_item_id,
+                        call_id=tool.call_id,
+                        name=tool.name,
+                        arguments=tool.arguments,
+                        status=tool.status or "completed",
+                    )
+                )
+                st.last_item_id = function_item_id
         return events

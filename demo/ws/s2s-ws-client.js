@@ -96,7 +96,8 @@ import { OrbVisualiser, VIS_FFT_SIZE } from "./orb-visualizer.js";
 import { SentAudioRecorder } from "./user-audio-recorder.js";
 
 /** Build an Error carrying a `code` (and optional extra fields) so callers can
- *  branch on the failure kind: "limit" | "queue-full" | "queue-expired" | "aborted".
+ *  branch on the failure kind: "login-required" | "limit" | "queue-full" |
+ *  "queue-expired" | "aborted".
  *  @param {string} message @param {string} code @param {object} [extra] */
 function _codedError(message, code, extra) {
   const err = /** @type {Error & { code?: string }} */ (new Error(message));
@@ -177,12 +178,12 @@ export class S2sWsRealtimeClient extends EventTarget {
      * UI can tell a barge-in cut (keep it) from a never-heard speculative
      * response (drop it). */
     this._audibleResponses = new Set();
-    /** @type {Map<string, string>} The CURRENT assistant transcript segment per
-     * response, accumulated from streamed deltas (reset on each segment's done). */
+    /** @type {Map<string, string>} The in-progress assistant transcript per
+     * response, accumulated from streamed deltas until the terminal done. */
     this._asstTranscriptByResp = new Map();
-    /** @type {Map<string, string>} Completed assistant transcript segments per
-     * response, space-joined. A single response can emit several
-     * `*.transcript.done` events; we concatenate them until response.done. */
+    /** @type {Map<string, string>} Terminal assistant transcript per response.
+     * Realtime emits one `*.transcript.done`; appending remains for compatibility
+     * with legacy endpoints that emitted a done event for every text segment. */
     this._asstFullByResp = new Map();
     this._muted = false;
     // ── Response lock ────────────────────────────────────────────────────
@@ -222,8 +223,8 @@ export class S2sWsRealtimeClient extends EventTarget {
     this.dispatchEvent(new CustomEvent("status", { detail: { status } }));
   }
 
-  /** Full assistant transcript so far for a response: the completed segments
-   *  plus the in-progress one, all space-joined.
+  /** Full assistant transcript so far for a response: a terminal transcript,
+   *  when present, plus any in-progress deltas from a legacy segmented stream.
    *  @param {string} rid @returns {string} */
   _asstDisplay(rid) {
     const full = this._asstFullByResp.get(rid) || "";
@@ -362,6 +363,12 @@ export class S2sWsRealtimeClient extends EventTarget {
       const body = await response.json().catch(() => ({}));
       throw _codedError("Daily conversation limit reached", "limit", { tier: body?.tier });
     }
+    if (response.status === 401) {
+      const body = await response.json().catch(() => ({}));
+      throw _codedError("Sign in again to continue", "login-required", {
+        loginUrl: body?.loginUrl,
+      });
+    }
     if (response.status === 503) {
       const body = await response.json().catch(() => ({}));
       if (body?.state === "at_capacity") {
@@ -413,6 +420,12 @@ export class S2sWsRealtimeClient extends EventTarget {
       if (response.status === 402) {
         const body = await response.json().catch(() => ({}));
         throw _codedError("Daily conversation limit reached", "limit", { tier: body?.tier });
+      }
+      if (response.status === 401) {
+        const body = await response.json().catch(() => ({}));
+        throw _codedError("Sign in again to continue", "login-required", {
+          loginUrl: body?.loginUrl,
+        });
       }
       if (response.status === 404) {
         throw _codedError("Queue timed out", "queue-expired");
@@ -763,9 +776,9 @@ export class S2sWsRealtimeClient extends EventTarget {
         const audible = responseId ? this._audibleResponses.has(responseId) : false;
         this._audibleResponses.delete(responseId);
         // Pull whatever transcript the response carries, falling back to the
-        // segments we concatenated from the `*.transcript.done` events (plus any
-        // in-progress delta). For an interrupted reply the response payload may
-        // be empty, so this is the last chance to capture the text.
+        // terminal `*.transcript.done` value (plus any in-progress delta from a
+        // legacy segmented stream). For an interrupted reply the response
+        // payload may be empty, so this is the last chance to capture the text.
         const transcript =
           extractResponseTranscript(event.response) ||
           this._asstDisplay(responseId) ||
@@ -832,6 +845,10 @@ export class S2sWsRealtimeClient extends EventTarget {
               },
             }),
           );
+        } else if (this._status === "processing" && !this._responsePending()) {
+          // Empty STT results intentionally do not create a response, so there
+          // will be no response.done event to return the UI to listening.
+          this._setStatus("connected");
         }
         break;
       }
@@ -847,7 +864,7 @@ export class S2sWsRealtimeClient extends EventTarget {
         const delta = typeof event.delta === "string" ? event.delta : "";
         if (delta) {
           this._asstTranscriptByResp.set(rid, (this._asstTranscriptByResp.get(rid) || "") + delta);
-          // Show completed segments + the segment streaming in right now.
+          // Show the complete transcript accumulated from deltas so far.
           this.dispatchEvent(
             new CustomEvent("transcript", {
               detail: { role: "assistant", text: this._asstDisplay(rid), partial: true, responseId: rid },
@@ -860,13 +877,14 @@ export class S2sWsRealtimeClient extends EventTarget {
       case "response.audio_transcript.done":
       case "response.output_audio_transcript.done": {
         const rid = typeof event.response_id === "string" ? event.response_id : "";
-        // This is ONE completed segment. A response can emit several; concatenate
-        // them, space-separated, until response.done clears the accumulator.
+        // This terminalizes the assistant transcript for the response. Realtime
+        // emits it once after all deltas; retain space-joining only for legacy
+        // endpoints that emitted a done event for every text segment.
         const segment =
           (typeof event.transcript === "string" && event.transcript) ||
           this._asstTranscriptByResp.get(rid) ||
           "";
-        this._asstTranscriptByResp.delete(rid); // segment finished; next one starts fresh
+        this._asstTranscriptByResp.delete(rid);
         if (segment) {
           const prev = this._asstFullByResp.get(rid) || "";
           this._asstFullByResp.set(rid, prev ? `${prev} ${segment}` : segment);
@@ -1069,6 +1087,11 @@ export class S2sWsRealtimeClient extends EventTarget {
   /** True while a response occupies the single backend slot. */
   _responseActive() {
     return this._openResponses > 0 || this._createInFlight;
+  }
+
+  /** True while a response is active, awaiting confirmation, or queued. */
+  _responsePending() {
+    return this._responseActive() || this._createQueue.length > 0;
   }
 
   /** Send a response.create immediately and arm the in-flight guard. Any image

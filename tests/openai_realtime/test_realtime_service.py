@@ -10,6 +10,7 @@ from queue import Queue
 from threading import Event, Thread
 from time import sleep
 
+import numpy as np
 import pytest
 from openai.types.realtime import (
     ConversationItemCreatedEvent,
@@ -22,6 +23,7 @@ from openai.types.realtime import (
     RealtimeErrorEvent,
     ResponseAudioDeltaEvent,
     ResponseAudioDoneEvent,
+    ResponseAudioTranscriptDeltaEvent,
     ResponseAudioTranscriptDoneEvent,
     ResponseCancelEvent,
     ResponseCreatedEvent,
@@ -31,7 +33,12 @@ from openai.types.realtime import (
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
     SessionCreatedEvent,
+    SessionUpdatedEvent,
     SessionUpdateEvent,
+)
+from openai.types.realtime.conversation_item import (
+    RealtimeConversationItemAssistantMessage,
+    RealtimeConversationItemFunctionCall,
 )
 
 from speech_to_speech.api.openai_realtime.service import (
@@ -40,6 +47,7 @@ from speech_to_speech.api.openai_realtime.service import (
 )
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
+    AudioInputCompletedEvent,
     PartialTranscriptionEvent,
     ResponseFailedEvent,
     SpeechStartedEvent,
@@ -83,6 +91,18 @@ class TestConnectionLifecycle:
         assert st.last_item_id is None
         service.unregister(sid)
 
+    def test_register_applies_server_default_instructions(self, text_prompt_queue, should_listen):
+        service = RealtimeService(
+            text_prompt_queue=text_prompt_queue,
+            should_listen=should_listen,
+            default_instructions="Use the configured persona.",
+        )
+
+        sid = service.register()
+
+        assert service._state(sid).runtime_config.session.instructions == "Use the configured persona."
+        service.unregister(sid)
+
     def test_unregister_removes_state(self, service):
         sid = service.register()
         service.unregister(sid)
@@ -116,6 +136,21 @@ class TestConnectionLifecycle:
         assert evt.session.tool_choice == "auto"
         assert evt.session.audio.output.voice == "echo"
         assert evt.session.audio.input.turn_detection.type == "server_vad"
+
+    def test_build_session_updated(self, service, conn_id, runtime_config):
+        service.handle_session_update(
+            conn_id,
+            SessionUpdateEvent(
+                type="session.update",
+                session={"type": "realtime", "instructions": "Be concise"},
+            ),
+        )
+
+        evt = service.build_session_updated(conn_id)
+        assert isinstance(evt, SessionUpdatedEvent)
+        assert evt.event_id.startswith("event_")
+        assert evt.session is not None
+        assert evt.session.instructions == "Be concise"
 
 
 # ===================================================================
@@ -708,6 +743,18 @@ class TestHandleResponseCancel:
 
 
 class TestEncodeAudioChunk:
+    def test_begin_audio_output_reserves_assistant_item_for_media_transports(self, service, conn_id):
+        _, item_id, output_index, events = service.begin_audio_output(conn_id)
+
+        st = service._state(conn_id)
+        assert isinstance(events[0], ResponseCreatedEvent)
+        assert st.pending_assistant_item_id == item_id
+        assert st.pending_assistant_output_index == output_index == 0
+        assert st.last_item_id == item_id
+
+        done = next(e for e in service.finish_response(conn_id) if isinstance(e, ResponseDoneEvent))
+        assert done.response.output[0].id == item_id
+
     def test_first_chunk_emits_response_created_and_delta(self, service, conn_id):
         audio = _pcm_bytes(256)
         events = service.encode_audio_chunk(conn_id, audio)
@@ -788,6 +835,359 @@ class TestFinishAudioResponse:
         assert st.current_response_id is None
         assert st.current_item_id is None
         assert st.current_response_params is None
+        assert st.pending_assistant_item_id is None
+        assert st.pending_assistant_output_index is None
+        assert not st.pending_function_calls
+
+
+class TestResponseDoneOutputItems:
+    """response.done's response.output must carry the actual generated items,
+    per https://platform.openai.com/docs/api-reference/realtime-server-events/session/updated —
+    OpenAI's own docs: "response.done will also have the complete data we
+    need to call our function." Without this, clients that read function
+    calls from response.done (rather than only the incremental
+    response.function_call_arguments.done event) never see them.
+    """
+
+    def test_output_includes_function_call_item(self, service, conn_id):
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                text="Sure, ending the call.",
+                tools=[{"type": "function_call", "call_id": "call_1", "name": "endCall", "arguments": "{}"}],
+            ),
+        )
+        events = service.finish_response(conn_id)
+        done = next(e for e in events if isinstance(e, ResponseDoneEvent))
+        function_calls = [
+            item for item in done.response.output if isinstance(item, RealtimeConversationItemFunctionCall)
+        ]
+        assert len(function_calls) == 1
+        assert function_calls[0].name == "endCall"
+        assert function_calls[0].call_id == "call_1"
+        assert function_calls[0].arguments == "{}"
+
+    def test_function_call_only_response_skips_audio_done(self, service, conn_id):
+        stream_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                text="",
+                tools=[
+                    {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "endCall",
+                        "arguments": "{}",
+                    }
+                ],
+            ),
+        )
+
+        terminal_events = service.finish_response(conn_id)
+        done = next(e for e in terminal_events if isinstance(e, ResponseDoneEvent))
+        function_event = next(e for e in stream_events if isinstance(e, ResponseFunctionCallArgumentsDoneEvent))
+
+        assert [type(event) for event in terminal_events] == [ResponseDoneEvent]
+        assert [item.id for item in done.response.output] == [function_event.item_id]
+
+    def test_output_includes_assistant_audio_message(self, service, conn_id):
+        service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="First sentence."))
+        service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="Second sentence."))
+        events = service.finish_response(conn_id)
+        done = next(e for e in events if isinstance(e, ResponseDoneEvent))
+        messages = [item for item in done.response.output if isinstance(item, RealtimeConversationItemAssistantMessage)]
+        assert len(messages) == 1
+        assert messages[0].content[0].type == "output_audio"
+        assert messages[0].content[0].transcript == "First sentence. Second sentence."
+
+    def test_output_includes_assistant_text_message(self, service, conn_id):
+        from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
+
+        service._state(conn_id).current_response_params = RealtimeResponseCreateParams(
+            output_modalities=["text"],
+        )
+        service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="Hello there."))
+        events = service.finish_response(conn_id)
+        done = next(e for e in events if isinstance(e, ResponseDoneEvent))
+        messages = [item for item in done.response.output if isinstance(item, RealtimeConversationItemAssistantMessage)]
+        assert len(messages) == 1
+        assert messages[0].content[0].type == "output_text"
+        assert messages[0].content[0].text == "Hello there."
+
+    def test_output_empty_when_response_has_no_content(self, service, conn_id):
+        service.response._ensure_response(conn_id)
+        events = service.finish_response(conn_id)
+        done = next(e for e in events if isinstance(e, ResponseDoneEvent))
+        assert not done.response.output
+
+    def test_function_call_item_id_matches_its_arguments_done_event(self, service, conn_id):
+        """A client correlating the streamed arguments event with the item in
+        response.output by item_id must find the same id in both places.
+        """
+        stream_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                text="One moment.",
+                tools=[{"type": "function_call", "call_id": "call_1", "name": "endCall", "arguments": "{}"}],
+            ),
+        )
+        args_done = next(e for e in stream_events if isinstance(e, ResponseFunctionCallArgumentsDoneEvent))
+
+        done = next(e for e in service.finish_response(conn_id) if isinstance(e, ResponseDoneEvent))
+        call_item = next(
+            item for item in done.response.output if isinstance(item, RealtimeConversationItemFunctionCall)
+        )
+        assert call_item.id == args_done.item_id
+
+    def test_every_output_item_has_a_distinct_id(self, service, conn_id):
+        stream_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                text="One moment.",
+                tools=[
+                    {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "first",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call",
+                        "id": "fc_2",
+                        "call_id": "call_2",
+                        "name": "second",
+                        "arguments": "{}",
+                    },
+                ],
+            ),
+        )
+        args_done = [e for e in stream_events if isinstance(e, ResponseFunctionCallArgumentsDoneEvent)]
+        done = next(e for e in service.finish_response(conn_id) if isinstance(e, ResponseDoneEvent))
+
+        output_ids = [item.id for item in done.response.output]
+        assert all(output_ids)
+        assert len(set(output_ids)) == len(output_ids)
+        assert [event.item_id for event in args_done] == ["fc_1", "fc_2"]
+        assert output_ids[1:] == ["fc_1", "fc_2"]
+
+    def test_output_indexes_match_final_items_across_pipeline_chunks(self, service, conn_id):
+        text_events = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="One moment."))
+        tool_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                text="",
+                tools=[
+                    {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "first",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call",
+                        "id": "fc_2",
+                        "call_id": "call_2",
+                        "name": "second",
+                        "arguments": "{}",
+                    },
+                ],
+            ),
+        )
+        terminal_events = service.finish_response(conn_id)
+        done = next(e for e in terminal_events if isinstance(e, ResponseDoneEvent))
+        output_events = [
+            e
+            for e in [*text_events, *tool_events]
+            if isinstance(e, (ResponseAudioTranscriptDeltaEvent, ResponseFunctionCallArgumentsDoneEvent))
+        ]
+
+        assert [event.output_index for event in output_events] == [0, 1, 2]
+        for event in output_events:
+            assert done.response.output[event.output_index].id == event.item_id
+
+    def test_output_order_is_preserved_when_tool_precedes_text(self, service, conn_id):
+        tool_event = next(
+            e
+            for e in service.dispatch_pipeline_event(
+                conn_id,
+                AssistantTextEvent(
+                    text="",
+                    tools=[
+                        {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "first",
+                            "arguments": "{}",
+                        }
+                    ],
+                ),
+            )
+            if isinstance(e, ResponseFunctionCallArgumentsDoneEvent)
+        )
+        text_event = next(
+            e
+            for e in service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="After the call."))
+            if isinstance(e, ResponseAudioTranscriptDeltaEvent)
+        )
+        terminal_events = service.finish_response(conn_id)
+        audio_done = next(e for e in terminal_events if isinstance(e, ResponseAudioDoneEvent))
+        done = next(e for e in terminal_events if isinstance(e, ResponseDoneEvent))
+
+        assert tool_event.output_index == 0
+        assert text_event.output_index == 1
+        assert audio_done.output_index == 1
+        assert [item.id for item in done.response.output] == [tool_event.item_id, text_event.item_id]
+
+    def test_audio_delta_reuses_known_assistant_output_identity(self, service, conn_id):
+        text_event = next(
+            e
+            for e in service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="Speaking now."))
+            if isinstance(e, ResponseAudioTranscriptDeltaEvent)
+        )
+        audio_delta = next(
+            e for e in service.encode_audio_chunk(conn_id, _pcm_bytes(256)) if isinstance(e, ResponseAudioDeltaEvent)
+        )
+        done = next(e for e in service.finish_response(conn_id) if isinstance(e, ResponseDoneEvent))
+
+        assert audio_delta.item_id == text_event.item_id
+        assert audio_delta.output_index == text_event.output_index
+        assert done.response.output[audio_delta.output_index].id == audio_delta.item_id
+
+    def test_audio_first_reserves_assistant_identity_across_tool_and_text_chunks(self, service, conn_id):
+        audio_delta = next(
+            e for e in service.encode_audio_chunk(conn_id, _pcm_bytes(256)) if isinstance(e, ResponseAudioDeltaEvent)
+        )
+        tool_event = next(
+            e
+            for e in service.dispatch_pipeline_event(
+                conn_id,
+                AssistantTextEvent(
+                    text="",
+                    tools=[
+                        {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "first",
+                            "arguments": "{}",
+                        }
+                    ],
+                ),
+            )
+            if isinstance(e, ResponseFunctionCallArgumentsDoneEvent)
+        )
+        text_event = next(
+            e
+            for e in service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="Speaking now."))
+            if isinstance(e, ResponseAudioTranscriptDeltaEvent)
+        )
+
+        terminal_events = service.finish_response(conn_id)
+        audio_done = next(e for e in terminal_events if isinstance(e, ResponseAudioDoneEvent))
+        done = next(e for e in terminal_events if isinstance(e, ResponseDoneEvent))
+
+        assert audio_delta.output_index == text_event.output_index == audio_done.output_index == 0
+        assert audio_delta.item_id == text_event.item_id == audio_done.item_id
+        assert tool_event.output_index == 1
+        assert [item.id for item in done.response.output] == [audio_delta.item_id, tool_event.item_id]
+        assert service._state(conn_id).last_item_id == tool_event.item_id
+
+    def test_cancelled_audio_keeps_reserved_assistant_output_item(self, service, conn_id):
+        tool_event = next(
+            e
+            for e in service.dispatch_pipeline_event(
+                conn_id,
+                AssistantTextEvent(
+                    text="",
+                    tools=[
+                        {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "first",
+                            "arguments": "{}",
+                        }
+                    ],
+                ),
+            )
+            if isinstance(e, ResponseFunctionCallArgumentsDoneEvent)
+        )
+        audio_delta = next(
+            e for e in service.encode_audio_chunk(conn_id, _pcm_bytes(256)) if isinstance(e, ResponseAudioDeltaEvent)
+        )
+
+        terminal_events = service.finish_response(conn_id, status="cancelled", reason="client_cancelled")
+        done = next(e for e in terminal_events if isinstance(e, ResponseDoneEvent))
+
+        assert tool_event.output_index == 0
+        assert audio_delta.output_index == 1
+        assert [item.id for item in done.response.output] == [tool_event.item_id, audio_delta.item_id]
+        assert [item.status for item in done.response.output] == ["completed", "incomplete"]
+        assistant = done.response.output[audio_delta.output_index]
+        assert isinstance(assistant, RealtimeConversationItemAssistantMessage)
+        assert assistant.content[0].type == "output_audio"
+        assert assistant.content[0].transcript == ""
+
+    def test_assistant_id_survives_non_interrupting_user_speech(self, service, conn_id):
+        transcript_event = next(
+            e
+            for e in service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="Still speaking."))
+            if isinstance(e, ResponseAudioTranscriptDeltaEvent)
+        )
+        speech_event = next(
+            e
+            for e in service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(interrupt_response=False),
+            )
+            if isinstance(e, InputAudioBufferSpeechStartedEvent)
+        )
+        done = next(e for e in service.finish_response(conn_id) if isinstance(e, ResponseDoneEvent))
+        message = next(
+            item for item in done.response.output if isinstance(item, RealtimeConversationItemAssistantMessage)
+        )
+
+        assert message.id == transcript_event.item_id
+        assert message.id != speech_event.item_id
+
+    def test_cancelled_response_preserves_completed_function_call(self, service, conn_id):
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                text="One moment.",
+                tools=[{"type": "function_call", "call_id": "call_1", "name": "endCall", "arguments": "{}"}],
+            ),
+        )
+        events = service.finish_response(conn_id, status="cancelled", reason="client_cancelled")
+        done = next(e for e in events if isinstance(e, ResponseDoneEvent))
+        assert done.response.output
+        assert [item.status for item in done.response.output] == ["incomplete", "completed"]
+
+    def test_cancelled_response_marks_unfinished_function_call_incomplete(self, service, conn_id):
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                text="",
+                tools=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "endCall",
+                        "arguments": "{}",
+                        "status": "in_progress",
+                    }
+                ],
+            ),
+        )
+        events = service.finish_response(conn_id, status="cancelled", reason="client_cancelled")
+        done = next(e for e in events if isinstance(e, ResponseDoneEvent))
+
+        assert len(done.response.output) == 1
+        assert done.response.output[0].status == "incomplete"
 
 
 # ===================================================================
@@ -923,17 +1323,93 @@ class TestDispatchPipelineEvent:
 
     # -- assistant_text --
 
-    def test_assistant_text_emits_transcript_done(self, service, conn_id):
+    def test_assistant_text_emits_transcript_delta(self, service, conn_id):
         events = service.dispatch_pipeline_event(
             conn_id,
             AssistantTextEvent(text="Hello there"),
         )
         assert len(events) == 1
         evt = events[0]
-        assert isinstance(evt, ResponseAudioTranscriptDoneEvent)
+        assert isinstance(evt, ResponseAudioTranscriptDeltaEvent)
         assert evt.content_index == 0
         assert evt.output_index == 0
-        assert evt.transcript == "Hello there"
+        assert evt.delta == "Hello there"
+
+    def test_audio_transcript_deltas_match_single_terminal_done(self, service, conn_id):
+        first = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="Hello there."))
+        second = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="How are you?"))
+
+        deltas = [event for event in [*first, *second] if isinstance(event, ResponseAudioTranscriptDeltaEvent)]
+        assert [event.delta for event in deltas] == ["Hello there.", " How are you?"]
+        assert not any(isinstance(event, ResponseAudioTranscriptDoneEvent) for event in [*first, *second])
+
+        terminal = service.finish_response(conn_id)
+        transcript_done = [event for event in terminal if isinstance(event, ResponseAudioTranscriptDoneEvent)]
+        response_done = next(event for event in terminal if isinstance(event, ResponseDoneEvent))
+        assert len(transcript_done) == 1
+        assert transcript_done[0].transcript == "".join(event.delta for event in deltas)
+        assert (
+            transcript_done[0].response_id,
+            transcript_done[0].item_id,
+            transcript_done[0].output_index,
+            transcript_done[0].content_index,
+        ) == (
+            deltas[0].response_id,
+            deltas[0].item_id,
+            deltas[0].output_index,
+            deltas[0].content_index,
+        )
+        assert response_done.response.output[transcript_done[0].output_index].id == transcript_done[0].item_id
+        assert [event.type for event in terminal] == [
+            "response.output_audio.done",
+            "response.output_audio_transcript.done",
+            "response.done",
+        ]
+
+    def test_audio_transcript_normalizes_chunk_whitespace_in_deltas_and_done(self, service, conn_id):
+        first = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="  Hello there.  \n"))
+        whitespace = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text=" \t\n"))
+        second = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="  How are you?  "))
+
+        deltas = [
+            event for event in [*first, *whitespace, *second] if isinstance(event, ResponseAudioTranscriptDeltaEvent)
+        ]
+        assert [event.delta for event in deltas] == ["Hello there.", " How are you?"]
+
+        terminal = service.finish_response(conn_id)
+        transcript_done = next(event for event in terminal if isinstance(event, ResponseAudioTranscriptDoneEvent))
+        assert transcript_done.transcript == "".join(event.delta for event in deltas) == "Hello there. How are you?"
+
+    def test_cancelled_audio_transcript_emits_single_terminal_done(self, service, conn_id):
+        delta = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="partial"))[0]
+
+        terminal = service.finish_response(conn_id, status="cancelled", reason="client_cancelled")
+        transcript_done = [event for event in terminal if isinstance(event, ResponseAudioTranscriptDoneEvent)]
+        response_done = next(event for event in terminal if isinstance(event, ResponseDoneEvent))
+
+        assert isinstance(delta, ResponseAudioTranscriptDeltaEvent)
+        assert len(transcript_done) == 1
+        assert transcript_done[0].transcript == delta.delta == "partial"
+        assert response_done.response.status == "cancelled"
+        assert response_done.response.output[0].status == "incomplete"
+
+    @pytest.mark.parametrize("status", ["failed", "incomplete"])
+    def test_non_completed_audio_transcript_emits_single_terminal_done(self, service, conn_id, status):
+        delta = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="partial"))[0]
+
+        terminal = service.finish_response(conn_id, status=status)
+        transcript_done = [event for event in terminal if isinstance(event, ResponseAudioTranscriptDoneEvent)]
+        response_done = next(event for event in terminal if isinstance(event, ResponseDoneEvent))
+
+        assert len(transcript_done) == 1
+        assert transcript_done[0].transcript == delta.delta == "partial"
+        assert [event.type for event in terminal] == [
+            "response.output_audio.done",
+            "response.output_audio_transcript.done",
+            "response.done",
+        ]
+        assert response_done.response.status == status
+        assert response_done.response.output[0].status == "incomplete"
 
     def test_assistant_text_with_tools(self, service, conn_id):
         events = service.dispatch_pipeline_event(
@@ -947,7 +1423,7 @@ class TestDispatchPipelineEvent:
             ),
         )
         assert len(events) == 3
-        assert isinstance(events[0], ResponseAudioTranscriptDoneEvent)
+        assert isinstance(events[0], ResponseAudioTranscriptDeltaEvent)
         assert events[0].output_index == 0
         assert isinstance(events[1], ResponseFunctionCallArgumentsDoneEvent)
         assert events[1].output_index == 1
@@ -1105,8 +1581,8 @@ class TestDispatchPipelineEvent:
         thread.join(timeout=1.0)
 
         assert len(result["events"]) == 1
-        assert isinstance(result["events"][0], ResponseAudioTranscriptDoneEvent)
-        assert result["events"][0].transcript == "latest"
+        assert isinstance(result["events"][0], ResponseAudioTranscriptDeltaEvent)
+        assert result["events"][0].delta == "latest"
         assert tracker.is_committed("turn_1", 0)
         service.unregister(conn_id)
 
@@ -1162,8 +1638,8 @@ class TestDispatchPipelineEvent:
 
         assert events is not None
         assert len(events) == 1
-        assert isinstance(events[0], ResponseAudioTranscriptDoneEvent)
-        assert events[0].transcript == "latest"
+        assert isinstance(events[0], ResponseAudioTranscriptDeltaEvent)
+        assert events[0].delta == "latest"
         assert tracker.is_committed("turn_1", 0)
         service.unregister(conn_id)
 
@@ -1186,8 +1662,8 @@ class TestDispatchPipelineEvent:
 
         assert events is not None
         assert len(events) == 1
-        assert isinstance(events[0], ResponseAudioTranscriptDoneEvent)
-        assert events[0].transcript == "latest"
+        assert isinstance(events[0], ResponseAudioTranscriptDeltaEvent)
+        assert events[0].delta == "latest"
         assert tracker.is_committed("turn_1", 0)
         service.unregister(conn_id)
 
@@ -1248,6 +1724,44 @@ class TestDispatchPipelineEvent:
         assert evt.usage.seconds == 3.2
         assert evt.usage.type == "duration"
         assert service._state(conn_id).response_pending is True
+
+    def test_audio_input_completed_marks_response_pending_and_preserves_duration(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        audio = np.zeros(40000, dtype=np.float32)
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        service.dispatch_pipeline_event(conn_id, SpeechStoppedEvent(duration_s=2.5))
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            AudioInputCompletedEvent(
+                audio=audio,
+                audio_sample_rate=16000,
+                audio_duration_s=2.5,
+                turn_id="turn_1",
+                turn_revision=0,
+            ),
+        )
+
+        assert events == []
+        state = service._state(conn_id)
+        assert state.response_pending is True
+        assert state.response_usage.audio_duration_s == 2.5
+        request = text_prompt_queue.get_nowait()
+        assert isinstance(request, GenerateResponseRequest)
+        assert request.runtime_config is runtime_config
+        assert np.array_equal(request.audio, audio)
+        assert request.audio_sample_rate == 16000
+        assert request.turn_id == "turn_1"
+        assert request.turn_revision == 0
+
+        service.response._ensure_response(conn_id)
+        assert state.input_audio_duration_s == 0.0
+        assert state.response_usage.audio_duration_s == 2.5
 
     def test_empty_transcription_completed_emits_event_without_response(
         self,

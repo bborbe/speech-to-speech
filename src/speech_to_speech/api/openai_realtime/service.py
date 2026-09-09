@@ -15,10 +15,13 @@ from openai.types.realtime import (
     InputAudioBufferSpeechStartedEvent,
     InputAudioBufferSpeechStoppedEvent,
     OutputAudioBufferClearEvent,
+    RealtimeConversationItemFunctionCall,
     RealtimeError,
     RealtimeErrorEvent,
+    RealtimeSessionCreateRequest,
     ResponseAudioDeltaEvent,
     ResponseAudioDoneEvent,
+    ResponseAudioTranscriptDeltaEvent,
     ResponseAudioTranscriptDoneEvent,
     ResponseCancelEvent,
     ResponseCreatedEvent,
@@ -28,6 +31,7 @@ from openai.types.realtime import (
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
     SessionCreatedEvent,
+    SessionUpdatedEvent,
     SessionUpdateEvent,
 )
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
@@ -43,6 +47,7 @@ from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.chat import Chat, make_user_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
+    AudioInputCompletedEvent,
     PartialTranscriptionEvent,
     PipelineEvent,
     ResponseFailedEvent,
@@ -88,6 +93,7 @@ ClientEvent = Union[
 
 ServerEvent = Union[
     SessionCreatedEvent,
+    SessionUpdatedEvent,
     RealtimeErrorEvent,
     InputAudioBufferSpeechStartedEvent,
     InputAudioBufferSpeechStoppedEvent,
@@ -98,6 +104,7 @@ ServerEvent = Union[
     ResponseDoneEvent,
     ResponseAudioDeltaEvent,
     ResponseAudioDoneEvent,
+    ResponseAudioTranscriptDeltaEvent,
     ResponseAudioTranscriptDoneEvent,
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseTextDeltaEvent,
@@ -172,6 +179,11 @@ class ConnState(BaseModel):
     last_item_id: Optional[str] = None
     current_response_params: RealtimeResponseCreateParams | None = None
     pending_output_text_parts: list[str] = Field(default_factory=list)
+    pending_assistant_item_id: Optional[str] = None
+    pending_assistant_output_index: Optional[int] = None
+    # Function calls the model has requested during the current response, so
+    # response.done's output can include them per the OpenAI Realtime protocol.
+    pending_function_calls: list[RealtimeConversationItemFunctionCall] = Field(default_factory=list)
     response_usage: UsageMetrics = Field(default_factory=UsageMetrics)
     speculative_turn_id: Optional[str] = None
     speculative_turn_revision: Optional[int] = None
@@ -191,9 +203,9 @@ class ConnState(BaseModel):
 class RealtimeService:
     """Translates between OpenAI Realtime protocol events and internal pipeline messages.
 
-    One instance is shared across all WebSocket connections.  Per-connection
-    state (response lifecycle, audio buffer) is tracked internally by
-    connection id.
+    Each PipelineUnit owns one instance and uses it for whichever WebSocket or
+    WebRTC session currently claims that unit. Per-session response and audio
+    state is keyed by connection id.
     """
 
     def __init__(
@@ -202,11 +214,13 @@ class RealtimeService:
         should_listen: ThreadingEvent | None = None,
         chat_size: int = 10,
         speculative_turns: SpeculativeTurnTracker | None = None,
+        default_instructions: str | None = None,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self.speculative_turns = speculative_turns
+        self._default_instructions = default_instructions
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
 
@@ -221,6 +235,7 @@ class RealtimeService:
             TokenUsageEvent: self._on_token_usage,
             PartialTranscriptionEvent: self.conversation.on_partial_transcription,
             TranscriptionCompletedEvent: self._on_transcription_completed,
+            AudioInputCompletedEvent: self._on_audio_input_completed,
             ResponseFailedEvent: self._on_response_failed,
         }
 
@@ -230,7 +245,15 @@ class RealtimeService:
         """Register a new connection and return its session_id."""
         if self.speculative_turns:
             self.speculative_turns.reset()
-        state = ConnState(runtime_config=RuntimeConfig(chat=Chat(self._chat_size)))
+        state = ConnState(
+            runtime_config=RuntimeConfig(
+                chat=Chat(self._chat_size),
+                session=RealtimeSessionCreateRequest(
+                    type="realtime",
+                    instructions=self._default_instructions,
+                ),
+            )
+        )
         self._conns[state.session_id] = state
         self.total_usage.connections += 1
         return state.session_id
@@ -285,6 +308,9 @@ class RealtimeService:
     def build_session_created(self, conn_id: str) -> SessionCreatedEvent:
         return self.session.build_session_created(conn_id)
 
+    def build_session_updated(self, conn_id: str) -> SessionUpdatedEvent:
+        return self.session.build_session_updated(conn_id)
+
     def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> Optional[RealtimeErrorEvent]:
         return self.session.handle_session_update(conn_id, event)
 
@@ -299,6 +325,9 @@ class RealtimeService:
 
     def begin_audio_response(self, conn_id: str) -> tuple[str, str, list[ServerEvent]]:
         return self.audio.begin_audio_response(conn_id)
+
+    def begin_audio_output(self, conn_id: str) -> tuple[str, str, int, list[ServerEvent]]:
+        return self.audio.begin_audio_output(conn_id)
 
     def encode_audio_chunk(self, conn_id: str, audio: bytes) -> list[ServerEvent]:
         return self.audio.encode_audio_chunk(conn_id, audio)
@@ -378,7 +407,13 @@ class RealtimeService:
             return False
         if not isinstance(
             event,
-            (PartialTranscriptionEvent, TranscriptionCompletedEvent, AssistantTextEvent, TokenUsageEvent),
+            (
+                PartialTranscriptionEvent,
+                TranscriptionCompletedEvent,
+                AudioInputCompletedEvent,
+                AssistantTextEvent,
+                TokenUsageEvent,
+            ),
         ):
             return False
         turn_id = getattr(event, "turn_id", None)
@@ -453,6 +488,38 @@ class RealtimeService:
             )
 
         return events
+
+    def _on_audio_input_completed(self, conn_id: str, event: AudioInputCompletedEvent) -> list[ServerEvent]:
+        """Record final input audio and queue its realtime LM request."""
+        st = self._state(conn_id)
+        same_speculative_turn = event.turn_id is not None and event.turn_id == st.speculative_user_turn_id
+        if same_speculative_turn:
+            st.response_usage.audio_duration_s -= st.speculative_audio_duration_s
+        else:
+            st.speculative_audio_duration_s = 0.0
+
+        st.input_audio_duration_s = event.audio_duration_s
+        st.response_usage.audio_duration_s += event.audio_duration_s
+        if event.turn_id is not None:
+            st.speculative_audio_duration_s = event.audio_duration_s
+            st.speculative_user_turn_id = event.turn_id
+            st.speculative_user_turn_revision = event.turn_revision
+            st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
+
+        queue = self.text_prompt_queue
+        if queue:
+            st.response_pending = True
+            queue.put(
+                GenerateResponseRequest(
+                    runtime_config=st.runtime_config,
+                    audio=event.audio,
+                    audio_sample_rate=event.audio_sample_rate,
+                    turn_id=event.turn_id,
+                    turn_revision=event.turn_revision,
+                    speech_stopped_at_s=event.speech_stopped_at_s,
+                )
+            )
+        return []
 
     # ── Metrics ────────────────────────────────────
 

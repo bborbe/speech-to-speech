@@ -41,9 +41,11 @@ class VADAudio(PipelineMessage):
 
     tag: Literal["vad_audio"] = "vad_audio"
     audio: np.ndarray
+    runtime_config: RuntimeConfig | None = None
     mode: Literal["progressive", "final"] | None = None
     turn_id: str | None = None
     turn_revision: int | None = None
+    processing_delay_s: float = 0.0
     created_at_s: float = Field(default_factory=perf_counter)
 
 
@@ -128,6 +130,10 @@ class TTSInput(PipelineMessage):
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
+    # Monotonic perf_counter captured when the text was forwarded to TTS, so
+    # the handler can split its text-ready -> audio-out window into queue wait
+    # (text sat in the queue) and synthesis time (model generate + lock wait).
+    text_ready_at_s: float | None = None
     cancel_generation: int | None = None
 
 
@@ -156,6 +162,8 @@ class GenerateResponseRequest(PipelineMessage):
     tag: Literal["generate_response"] = "generate_response"
     runtime_config: RuntimeConfig
     response: RealtimeResponseCreateParams | None = None
+    audio: np.ndarray | None = None
+    audio_sample_rate: int = 16000
     language_code: Optional[str] = None
     turn_id: str | None = None
     turn_revision: int | None = None
