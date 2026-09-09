@@ -899,9 +899,14 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         max_tokens: int,
         **generation_kwargs: Any,
     ) -> Iterator[bytes | np.ndarray]:
+        lock_wait_start = perf_counter()
         with MLXLockContext(handler_name="Qwen3TTS", timeout=10.0) as acquired:
             if not acquired:
                 raise TimeoutError("Timed out waiting for MLX lock")
+            # STT and TTS share the global MLX lock, so a busy STT or a cold
+            # MLX load can leave TTS waiting here. Log the wait separately from
+            # the hold (generation) time so the cold-start gap is attributable.
+            logger.info("Qwen3-TTS MLX lock wait: %.3fs (%s)", perf_counter() - lock_wait_start, label)
             yield from self._stream(
                 generation_fn(
                     **self._mlx_stream_kwargs(max_tokens=max_tokens),

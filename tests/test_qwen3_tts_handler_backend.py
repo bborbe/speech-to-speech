@@ -1093,3 +1093,50 @@ def test_process_voice_clone_scales_max_tokens_for_mlx_backend(monkeypatch):
     assert len(outputs) == 1
     assert captured["max_tokens"] == handler._estimate_max_new_tokens(long_text)
     assert captured["max_tokens"] > 360
+
+
+def test_process_logs_mlx_lock_wait_separately(monkeypatch, caplog):
+    """Lock wait is logged separately from hold/generation time per synthesis."""
+
+    class _FakeMLXLockContext:
+        def __init__(self, handler_name, timeout):
+            self.handler_name = handler_name
+            self.timeout = timeout
+
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.should_listen = Event()
+    handler.cancel_scope = None
+    handler.ref_audio = "TTS/ref_audio.wav"
+    handler.ref_text = "Reference text."
+    handler.speaker = None
+    handler.instruct = None
+    handler.language = "English"
+    handler.xvec_only = False
+    handler.parity_mode = False
+    handler.non_streaming_mode = None
+    handler.streaming_chunk_size = 4
+    handler.max_new_tokens = 1536
+    handler.blocksize = 512
+    handler.backend = "mlx"
+    handler.gen_kwargs = {}
+    handler.queue_in = Queue()
+    handler.model = SimpleNamespace(
+        config=SimpleNamespace(tts_model_type="base"),
+        generate=lambda **kwargs: iter([(_audible_stream_chunk(), 16000, {})]),
+    )
+    handler._prepare_mlx_ref_audio = lambda ref_audio: ref_audio
+
+    monkeypatch.setattr(qwen3_tts_module.console, "print", lambda *args, **kwargs: None)
+    monkeypatch.setattr(qwen3_tts_module, "MLXLockContext", _FakeMLXLockContext)
+
+    with caplog.at_level(logging.INFO, logger="speech_to_speech.TTS.qwen3_tts_handler"):
+        outputs = list(handler.process(TTSInput(text="Hello there.", turn_id="turn_1", turn_revision=0)))
+
+    assert len(outputs) == 1
+    assert "Qwen3-TTS MLX lock wait:" in caplog.text
