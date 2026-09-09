@@ -751,6 +751,78 @@ def test_process_skips_text_ready_latency_without_timestamp(monkeypatch, caplog)
     assert "Qwen3-TTS text-ready to first audio out:" not in caplog.text
 
 
+def test_process_emits_one_per_turn_summary_keyed_by_turn_id(monkeypatch, caplog):
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.should_listen = Event()
+    handler.cancel_scope = None
+    handler.speculative_turns = None
+    handler.ref_audio = "TTS/ref_audio.wav"
+    handler.speaker = None
+    handler.instruct = None
+    handler.language = "English"
+    handler.backend = "mlx"
+    handler.queue_in = Queue()
+    handler.model = SimpleNamespace(config=SimpleNamespace(tts_model_type="base"))
+    handler._apply_session_voice_override = lambda model_type, runtime_config=None, response=None: None
+
+    def _process_voice_clone(text):
+        yield np.zeros(512, dtype=np.int16)
+
+    handler._process_voice_clone = _process_voice_clone
+
+    monkeypatch.setattr(qwen3_tts_module.console, "print", lambda *args, **kwargs: None)
+
+    with caplog.at_level(logging.INFO, logger="speech_to_speech.TTS.qwen3_tts_handler"):
+        list(
+            handler.process(
+                TTSInput(
+                    text="Hello there.",
+                    turn_id="turn_1",
+                    turn_revision=0,
+                    speech_stopped_at_s=qwen3_tts_module.perf_counter() - 2.0,
+                    text_ready_at_s=qwen3_tts_module.perf_counter() - 1.0,
+                )
+            )
+        )
+        list(handler.process(EndOfResponse(turn_id="turn_1", turn_revision=0)))
+
+    summary_lines = [ln for ln in caplog.text.splitlines() if "Qwen3-TTS turn summary" in ln]
+    assert len(summary_lines) == 1
+    assert "(turn=turn_1 rev=0)" in summary_lines[0]
+    assert "last-speech->first-audio" in summary_lines[0]
+    assert "text-ready->dequeue" in summary_lines[0]
+    assert "dequeue->first-audio" in summary_lines[0]
+
+
+def test_process_emits_no_summary_without_audio(monkeypatch, caplog):
+    """A turn that produced no audio records nothing and emits no summary."""
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.should_listen = Event()
+    handler.cancel_scope = None
+    handler.speculative_turns = None
+    handler.ref_audio = "TTS/ref_audio.wav"
+    handler.speaker = None
+    handler.instruct = None
+    handler.language = "English"
+    handler.backend = "mlx"
+    handler.queue_in = Queue()
+    handler.model = SimpleNamespace(config=SimpleNamespace(tts_model_type="base"))
+    handler._apply_session_voice_override = lambda model_type, runtime_config=None, response=None: None
+
+    def _process_voice_clone(text):
+        yield from ()
+
+    handler._process_voice_clone = _process_voice_clone
+
+    monkeypatch.setattr(qwen3_tts_module.console, "print", lambda *args, **kwargs: None)
+
+    with caplog.at_level(logging.INFO, logger="speech_to_speech.TTS.qwen3_tts_handler"):
+        list(handler.process(TTSInput(text="Hello there.", turn_id="turn_1", turn_revision=0)))
+        list(handler.process(EndOfResponse(turn_id="turn_1", turn_revision=0)))
+
+    assert "Qwen3-TTS turn summary" not in caplog.text
+
+
 def test_process_does_not_set_should_listen_when_generation_fails(monkeypatch):
     """TTS no longer manages should_listen; the I/O streamer does via AUDIO_RESPONSE_DONE."""
     handler = object.__new__(Qwen3TTSHandler)

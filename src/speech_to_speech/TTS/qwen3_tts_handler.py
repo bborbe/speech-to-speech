@@ -795,6 +795,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 tts_input.turn_revision,
             ):
                 return
+            self._emit_turn_summary(tts_input)
             yield AUDIO_RESPONSE_DONE
             return
 
@@ -836,6 +837,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 if first_audio:
                     self._log_first_audio_latency(tts_input)
                     self._log_text_ready_latency(tts_input, dequeued_at_s)
+                    self._record_turn_latency(tts_input, dequeued_at_s)
                     first_audio = False
                 yield audio_chunk
         except Exception as e:
@@ -879,6 +881,72 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             tts_input.turn_id,
             tts_input.turn_revision,
         )
+
+    def _record_turn_latency(self, tts_input: TTSInput, dequeued_at_s: float) -> None:
+        """Remember the first sentence's timings so the turn summary can emit them.
+
+        A turn spans several TTSInputs (one per sentence); only the first one
+        that produced audio is recorded, keyed by (turn_id, turn_revision).
+        """
+        if tts_input.text_ready_at_s is None or tts_input.turn_id is None:
+            return
+        turn_state = getattr(self, "_turn_latency", None)
+        if turn_state is None:
+            turn_state = {}
+            self._turn_latency = turn_state
+        key = (tts_input.turn_id, tts_input.turn_revision)
+        if key in turn_state:
+            return
+        if len(turn_state) >= 32:
+            turn_state.pop(next(iter(turn_state)))
+        turn_state[key] = {
+            "speech_stopped_at_s": tts_input.speech_stopped_at_s,
+            "text_ready_at_s": tts_input.text_ready_at_s,
+            "dequeued_at_s": dequeued_at_s,
+            "first_audio_at_s": perf_counter(),
+        }
+
+    def _emit_turn_summary(self, tts_input: EndOfResponse) -> None:
+        """Emit one correlated per-turn line aggregating the stage timings.
+
+        This is the SC1 record: last-speech -> first-audio with the
+        text-ready -> dequeue (queue wait) and dequeue -> first-audio
+        (synthesis) split, keyed by turn id so the stages no longer need to
+        be pieced together from per-sentence log lines.
+        """
+        turn_state = getattr(self, "_turn_latency", None)
+        if not turn_state:
+            return
+        state = turn_state.pop((tts_input.turn_id, tts_input.turn_revision), None)
+        if state is None:
+            return
+        total_s = None
+        if state["speech_stopped_at_s"] is not None:
+            total_s = state["first_audio_at_s"] - state["speech_stopped_at_s"]
+            if total_s < 0:
+                return
+        queue_wait_s = state["dequeued_at_s"] - state["text_ready_at_s"]
+        synthesis_s = state["first_audio_at_s"] - state["dequeued_at_s"]
+        if total_s is not None:
+            logger.info(
+                "Qwen3-TTS turn summary (turn=%s rev=%s): last-speech->first-audio %.3fs "
+                "(text-ready->dequeue %.3fs, dequeue->first-audio %.3fs)",
+                tts_input.turn_id,
+                tts_input.turn_revision,
+                total_s,
+                queue_wait_s,
+                synthesis_s,
+            )
+        else:
+            logger.info(
+                "Qwen3-TTS turn summary (turn=%s rev=%s): text-ready->first-audio %.3fs "
+                "(text-ready->dequeue %.3fs, dequeue->first-audio %.3fs)",
+                tts_input.turn_id,
+                tts_input.turn_revision,
+                queue_wait_s + synthesis_s,
+                queue_wait_s,
+                synthesis_s,
+            )
 
     def _mlx_streaming_interval(self) -> float:
         return max(1, self.streaming_chunk_size) / MLX_STREAMING_TOKENS_PER_SECOND
