@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from queue import Queue
+from time import perf_counter
 
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.events import AssistantTextEvent, ResponseFailedEvent, TokenUsageEvent
@@ -144,5 +145,6 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
                 turn_id=lm_output.turn_id,
                 turn_revision=lm_output.turn_revision,
                 speech_stopped_at_s=lm_output.speech_stopped_at_s,
+                text_ready_at_s=perf_counter(),
                 cancel_generation=lm_output.cancel_generation,
             )

@@ -783,6 +783,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         return combined_text, language_code, saw_end_of_response
 
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
+        # Dequeue timestamp: the moment this handler picked the input up.
+        # Combined with tts_input.text_ready_at_s (set on enqueue by the LM
+        # output processor) this splits the text-ready -> audio-out window
+        # into queue wait and synthesis time.
+        dequeued_at_s = perf_counter()
         speculative_turns = getattr(self, "speculative_turns", None)
         if isinstance(tts_input, EndOfResponse):
             if speculative_turns and not speculative_turns.is_latest_after_reopen_grace(
@@ -830,6 +835,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             for audio_chunk in audio_iter:
                 if first_audio:
                     self._log_first_audio_latency(tts_input)
+                    self._log_text_ready_latency(tts_input, dequeued_at_s)
                     first_audio = False
                 yield audio_chunk
         except Exception as e:
@@ -844,6 +850,32 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         logger.info(
             "Last speech detected to first speech out: %.3fs (turn=%s rev=%s)",
             latency_s,
+            tts_input.turn_id,
+            tts_input.turn_revision,
+        )
+
+    def _log_text_ready_latency(self, tts_input: TTSInput, dequeued_at_s: float) -> None:
+        """Log the text-ready -> audio-out window and its queue-wait/synthesis split.
+
+        ``text_ready_at_s`` is captured by the LM output processor when the text
+        is forwarded to TTS (enqueue); ``dequeued_at_s`` is when this handler
+        picked the input up. The split makes the cold-start gap attributable:
+        queue wait (TTS still busy on a prior sentence, MLX lock blocked)
+        versus synthesis time (model load/generate).
+        """
+        if tts_input.text_ready_at_s is None:
+            return
+        first_audio_at_s = perf_counter()
+        total_s = first_audio_at_s - tts_input.text_ready_at_s
+        if total_s < 0:
+            return
+        queue_wait_s = dequeued_at_s - tts_input.text_ready_at_s
+        synthesis_s = first_audio_at_s - dequeued_at_s
+        logger.info(
+            "Qwen3-TTS text-ready to first audio out: %.3fs (queue wait %.3fs, synthesis %.3fs) (turn=%s rev=%s)",
+            total_s,
+            queue_wait_s,
+            synthesis_s,
             tts_input.turn_id,
             tts_input.turn_revision,
         )
