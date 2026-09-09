@@ -929,16 +929,30 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             turn_state = {}
             self._turn_latency = turn_state
         key = (tts_input.turn_id, tts_input.turn_revision)
-        if key in turn_state:
+        queue_wait_s = dequeued_at_s - tts_input.text_ready_at_s
+        if key not in turn_state:
+            if len(turn_state) >= 32:
+                turn_state.pop(next(iter(turn_state)))
+            turn_state[key] = {
+                "speech_stopped_at_s": tts_input.speech_stopped_at_s,
+                "text_ready_at_s": tts_input.text_ready_at_s,
+                "dequeued_at_s": dequeued_at_s,
+                "first_audio_at_s": perf_counter(),
+                "max_queue_wait_s": max(0.0, queue_wait_s),
+                "sentence_count": 1,
+            }
             return
-        if len(turn_state) >= 32:
-            turn_state.pop(next(iter(turn_state)))
-        turn_state[key] = {
-            "speech_stopped_at_s": tts_input.speech_stopped_at_s,
-            "text_ready_at_s": tts_input.text_ready_at_s,
-            "dequeued_at_s": dequeued_at_s,
-            "first_audio_at_s": perf_counter(),
-        }
+        # Aggregate across all sentences: keep the earliest text-ready/dequeue
+        # and the turn's first audio-out, plus the worst queue wait — a later
+        # sentence can sit in the queue while an earlier long one is still
+        # synthesising, and that wait is invisible if only the first sentence
+        # is recorded.
+        state = turn_state[key]
+        state["text_ready_at_s"] = min(state["text_ready_at_s"], tts_input.text_ready_at_s)
+        state["dequeued_at_s"] = min(state["dequeued_at_s"], dequeued_at_s)
+        state["first_audio_at_s"] = min(state["first_audio_at_s"], perf_counter())
+        state["max_queue_wait_s"] = max(state["max_queue_wait_s"], queue_wait_s)
+        state["sentence_count"] += 1
 
     def _emit_turn_summary(self, tts_input: EndOfResponse) -> None:
         """Emit one correlated per-turn line aggregating the stage timings.
@@ -961,25 +975,31 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 return
         queue_wait_s = state["dequeued_at_s"] - state["text_ready_at_s"]
         synthesis_s = state["first_audio_at_s"] - state["dequeued_at_s"]
+        max_queue_wait_s = state.get("max_queue_wait_s", queue_wait_s)
+        sentence_count = state.get("sentence_count", 1)
         if total_s is not None:
             logger.info(
                 "Qwen3-TTS turn summary (turn=%s rev=%s): last-speech->first-audio %.3fs "
-                "(text-ready->dequeue %.3fs, dequeue->first-audio %.3fs)",
+                "(text-ready->dequeue %.3fs, dequeue->first-audio %.3fs, max-queue-wait %.3fs, %d sentences)",
                 tts_input.turn_id,
                 tts_input.turn_revision,
                 total_s,
                 queue_wait_s,
                 synthesis_s,
+                max_queue_wait_s,
+                sentence_count,
             )
         else:
             logger.info(
                 "Qwen3-TTS turn summary (turn=%s rev=%s): text-ready->first-audio %.3fs "
-                "(text-ready->dequeue %.3fs, dequeue->first-audio %.3fs)",
+                "(text-ready->dequeue %.3fs, dequeue->first-audio %.3fs, max-queue-wait %.3fs, %d sentences)",
                 tts_input.turn_id,
                 tts_input.turn_revision,
                 queue_wait_s + synthesis_s,
                 queue_wait_s,
                 synthesis_s,
+                max_queue_wait_s,
+                sentence_count,
             )
 
     def _mlx_streaming_interval(self) -> float:
