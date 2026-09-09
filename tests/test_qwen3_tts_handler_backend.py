@@ -1,4 +1,5 @@
 import logging
+import re
 import sys
 from pathlib import Path
 from queue import Queue
@@ -792,6 +793,62 @@ def test_process_emits_one_per_turn_summary_keyed_by_turn_id(monkeypatch, caplog
     assert "last-speech->first-audio" in summary_lines[0]
     assert "text-ready->dequeue" in summary_lines[0]
     assert "dequeue->first-audio" in summary_lines[0]
+    assert "max-queue-wait" in summary_lines[0]
+    assert "1 sentences" in summary_lines[0]
+
+
+def test_process_turn_summary_aggregates_all_sentences(monkeypatch, caplog):
+    """A later sentence that waits in the queue shows up as max-queue-wait."""
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.should_listen = Event()
+    handler.cancel_scope = None
+    handler.speculative_turns = None
+    handler.ref_audio = "TTS/ref_audio.wav"
+    handler.speaker = None
+    handler.instruct = None
+    handler.language = "English"
+    handler.backend = "mlx"
+    handler.queue_in = Queue()
+    handler.model = SimpleNamespace(config=SimpleNamespace(tts_model_type="base"))
+    handler._apply_session_voice_override = lambda model_type, runtime_config=None, response=None: None
+
+    def _process_voice_clone(text):
+        yield np.zeros(512, dtype=np.int16)
+
+    handler._process_voice_clone = _process_voice_clone
+
+    monkeypatch.setattr(qwen3_tts_module.console, "print", lambda *args, **kwargs: None)
+
+    with caplog.at_level(logging.INFO, logger="speech_to_speech.TTS.qwen3_tts_handler"):
+        # First sentence: no queue wait.
+        list(
+            handler.process(
+                TTSInput(
+                    text="First.",
+                    turn_id="turn_1",
+                    turn_revision=0,
+                    text_ready_at_s=qwen3_tts_module.perf_counter() - 0.1,
+                )
+            )
+        )
+        # Second sentence: dequeued much later than text-ready (queue wait).
+        list(
+            handler.process(
+                TTSInput(
+                    text="Second.",
+                    turn_id="turn_1",
+                    turn_revision=0,
+                    text_ready_at_s=qwen3_tts_module.perf_counter() - 3.0,
+                )
+            )
+        )
+        list(handler.process(EndOfResponse(turn_id="turn_1", turn_revision=0)))
+
+    summary_lines = [ln for ln in caplog.text.splitlines() if "Qwen3-TTS turn summary" in ln]
+    assert len(summary_lines) == 1
+    assert "2 sentences" in summary_lines[0]
+    assert "max-queue-wait" in summary_lines[0]
+    assert re.search(r"max-queue-wait [2-4]\.", summary_lines[0])
 
 
 def test_process_emits_no_summary_without_audio(monkeypatch, caplog):
